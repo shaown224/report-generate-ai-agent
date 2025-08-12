@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary  # or mysqlclient if using MySQL
+python-dotenv
+pandas
+openai
+pymysql
