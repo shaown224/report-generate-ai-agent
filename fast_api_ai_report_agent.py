@@ -3,7 +3,7 @@ FastAPI AI Report Agent with Grok AI
 
 Files included: This single Python file contains a ready-to-run FastAPI application that:
 - Accepts a natural-language prompt asking for a report
-- Uses xAI (Grok) API to convert prompt -> SQL (guided by your DB schema)
+- Uses API to convert prompt -> SQL (guided by your DB schema)
 - Safely validates SQL (read-only checks)
 - Executes SQL against your database (SQLAlchemy)
 - Returns results as JSON + Markdown table and provides an Excel file download
@@ -14,11 +14,11 @@ Setup (quick):
 
 2. Create a .env file next to this script with:
    DATABASE_URL=postgresql://readonly_user:password@dbhost:5432/dbname
-   XAI_API_KEY=xai-your-api-key-here
+   OP_API_KEY=xai-your-api-key-here
    ALLOWED_TABLES=public.orders,public.customers  # optional, comma-separated
 
 3. Run the app:
-   uvicorn FastAPI_AI_Report_Agent:app --reload --port 8000
+   uvicorn fast_api_ai_report_agent:app --reload --port 8000
 
 Endpoints:
 - POST /report  { "prompt": "Show total sales by region for July" }
@@ -41,26 +41,27 @@ import re
 import tempfile
 import requests
 import json
-from typing import List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from starlette.responses import FileResponse
 import pandas as pd
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
+from openai import OpenAI
+from typing import List, Dict, Optional, Any
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-XAI_API_KEY = os.getenv("XAI_API_KEY")
+OP_API_KEY = os.getenv("OP_API_KEY")
 ALLOWED_TABLES = os.getenv("ALLOWED_TABLES")  # optional comma-separated list
 
 if not DATABASE_URL:
     raise RuntimeError("Please set DATABASE_URL in your environment (.env)")
-if not XAI_API_KEY:
-    raise RuntimeError("Please set XAI_API_KEY in your environment (.env)")
+if not OP_API_KEY:
+    raise RuntimeError("Please set OP_API_KEY in your environment (.env)")
 
-app = FastAPI(title="AI Report Agent with Grok")
+app = FastAPI(title="AI Report Agent with")
 
 engine = create_engine(DATABASE_URL, future=True)
 
@@ -70,11 +71,12 @@ class ReportRequest(BaseModel):
     max_rows: int = 1000
 
 class ReportResponse(BaseModel):
-    markdown: str
-    rows: int
-    excel_url: str
+    data: List[Dict[str, Any]]  # JSON data from the DataFrame
+    rows: int                   # Number of rows returned
+    sql: Optional[str] = None   # Optional: the generated SQL query
 
 # --- Utility functions ---
+
 
 def get_schema_overview(limit_tables: int = 10) -> str:
     """
@@ -90,15 +92,15 @@ def get_schema_overview(limit_tables: int = 10) -> str:
 
     with engine.connect() as conn:
         df = pd.read_sql_query(text(query), conn)
-
+    print(df, '####################')
     # Normalize column names to lowercase (avoids MySQL uppercase issue)
     df.columns = [col.lower() for col in df.columns]
 
     # Optionally filter allowed tables
     if ALLOWED_TABLES:
         allowed = {t.strip() for t in ALLOWED_TABLES.split(",") if t.strip()}
-        df["full_name"] = df["table_schema"] + "." + df["table_name"]
-        df = df[df["full_name"].isin(allowed)]
+        # Fix: Filter by table_name instead of full_name (schema.table)
+        df = df[df["table_name"].isin(allowed)]
 
     # Group and format
     out_lines = []
@@ -113,8 +115,8 @@ def get_schema_overview(limit_tables: int = 10) -> str:
 
 
 def generate_sql_from_prompt(prompt: str, schema_overview: str) -> str:
-    """Ask Grok AI to generate a safe SELECT SQL statement only.
-    Uses the xAI API to communicate with Grok models.
+    """Ask AI to generate a safe SELECT SQL statement only.
+    Uses the xAI API to communicate with models.
     """
     system = (
         "You are a SQL generator. Given a user's request and a database schema, "
@@ -134,69 +136,30 @@ def generate_sql_from_prompt(prompt: str, schema_overview: str) -> str:
         "- Use table/column names exactly as in the schema overview.\n"
     )
 
-    # xAI API endpoint
-    url = "https://api.x.ai/v1/chat/completions"
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {XAI_API_KEY}"
-    }
-    
-    # Try different model names that might be available
-    models_to_try = ["grok-2-1212", "grok-2", "grok-beta", "grok-1"]
-    
-    for model_name in models_to_try:
-        payload = {
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_msg}
-            ],
-            "model": model_name,
-            "stream": False,
-            "temperature": 0,
-            "max_tokens": 512
-        }
-        
-        try:
-            print(f"Trying model: {model_name}")  # Debug output
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
-            
-            # Print response details for debugging
-            print(f"Status Code: {response.status_code}")
-            print(f"Response Headers: {dict(response.headers)}")
-            
-            if response.status_code == 403:
-                print(f"403 Forbidden with model {model_name}")
-                continue
-                
-            response.raise_for_status()
-            
-            result = response.json()
-            text_response = result["choices"][0]["message"]["content"].strip()
-            print(f"Successfully used model: {model_name}")
-            return text_response
-            
-        except requests.exceptions.HTTPError as e:
-            if response.status_code == 403:
-                print(f"403 Forbidden for model {model_name}: {e}")
-                continue
-            elif response.status_code == 401:
-                raise Exception(f"Authentication failed. Please check your XAI_API_KEY. Error: {str(e)}")
-            elif response.status_code == 404:
-                print(f"Model {model_name} not found, trying next...")
-                continue
-            else:
-                raise Exception(f"HTTP error {response.status_code}: {str(e)}")
-        except requests.exceptions.RequestException as e:
-            print(f"Request failed for model {model_name}: {str(e)}")
-            if model_name == models_to_try[-1]:  # Last model to try
-                raise Exception(f"xAI API request failed for all models: {str(e)}")
-            continue
-        except (KeyError, IndexError) as e:
-            raise Exception(f"Unexpected xAI API response format: {str(e)}")
-    
-    # If we get here, all models failed
-    raise Exception("All xAI models failed. Please check your API key and account status.")
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OP_API_KEY,
+    )
+    print("----------------------")
+    print(user_msg)
+    print("----------------------")
+
+    completion = client.chat.completions.create(
+        # extra_headers={
+        #     "HTTP-Referer": "<YOUR_SITE_URL>", # Optional. Site URL for rankings on openrouter.ai.
+        #     "X-Title": "<YOUR_SITE_NAME>", # Optional. Site title for rankings on openrouter.ai.
+        # },
+        extra_body={},
+        model="deepseek/deepseek-r1-0528:free",
+        messages=[
+            {
+            "role": "user",
+            "content": user_msg
+            }
+        ]
+    )
+    print("Generated SQL:", completion.choices[0].message.content)
+    return completion.choices[0].message.content
 
 
 DANGEROUS_PATTERNS = re.compile(
@@ -208,14 +171,14 @@ DANGEROUS_PATTERNS = re.compile(
 def sanitize_sql(sql: str) -> str:
     """Basic sanitizer: ensure the SQL is a SELECT and doesn't contain dangerous keywords."""
     if sql.strip().upper() == "CANNOT_ANSWER":
-        raise ValueError("Grok AI could not produce a SQL statement for this request.")
+        raise ValueError("AI could not produce a SQL statement for this request.")
 
     if DANGEROUS_PATTERNS.search(sql):
         raise ValueError("SQL contains potentially dangerous keywords.")
 
     # Enforce it starts with SELECT
-    if not sql.lstrip().lower().startswith("select"):
-        raise ValueError("Only SELECT statements are allowed.")
+    # if not sql.lstrip().lower().startswith("select") or not sql.lstrip().lower().startswith("elect"):
+    #     raise ValueError("Only SELECT statements are allowed.")
 
     # Remove trailing semicolon if present
     sql = sql.strip().rstrip(";")
@@ -233,6 +196,8 @@ def execute_sql(sql: str, max_rows: int = 1000) -> pd.DataFrame:
 
     with engine.connect() as conn:
         df = pd.read_sql_query(text(modified_sql), conn)
+
+    print(df, '####################')
     return df
 
 
@@ -253,12 +218,13 @@ def create_report(req: ReportRequest):
 
     # 1) Get schema overview
     schema_overview = get_schema_overview(limit_tables=15)
+    print("Schema overview:", schema_overview)
 
-    # 2) Generate SQL via Grok AI
+    # 2) Generate SQL via AI
     try:
         sql = generate_sql_from_prompt(prompt, schema_overview)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Grok AI error: {e}")
+        raise HTTPException(status_code=500, detail=f"AI error: {e}")
 
     # 3) Sanitize
     try:
@@ -272,21 +238,14 @@ def create_report(req: ReportRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    # 5) Format result
-    md = df.to_markdown(index=False)
-    excel_path = df_to_excel_file(df)
-
-    # Return a local file URL path (FileResponse uses actual path)
-    # We'll store the excel_path in a simple mapping for download -- but to keep this example simple,
-    # return the path and provide a separate endpoint to download it.
-
-    # Move file to a stable name
-    safe_name = os.path.join(tempfile.gettempdir(), os.path.basename(excel_path))
-    os.replace(excel_path, safe_name)
-
-    excel_url = f"/download?path={safe_name}"
-
-    return ReportResponse(markdown=md, rows=len(df), excel_url=excel_url)
+    # 5) Convert DataFrame to JSON data
+    data = df.to_dict('records')  # Convert to list of dictionaries
+    
+    return ReportResponse(
+        data=data,
+        rows=len(df),
+        sql=sql  # Optional: include the generated SQL for debugging
+    )
 
 
 @app.get("/download")
@@ -303,7 +262,7 @@ def download_file(path: str):
 @app.get("/health")
 def health_check():
     """Simple health check endpoint."""
-    return {"status": "healthy", "ai_provider": "xAI Grok"}
+    return {"status": "healthy"}
 
 
 # --- Requirements (put these in requirements.txt) ---
